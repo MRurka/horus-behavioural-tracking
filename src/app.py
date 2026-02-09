@@ -9,6 +9,9 @@ from collections import deque
 # dataclass : a structured dictionary for settings
 from dataclasses import dataclass
 
+# face detection
+import mediapipe as mp
+
 import time
 
 
@@ -81,6 +84,21 @@ def main() -> None:
 
     print("cap.isOpened =", cap.isOpened())
 
+    # Reference face mesh and drawing utilities
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing = mp.solutions.drawing_utils
+
+    LEFT_IRIS_IDX = [474, 475, 476, 477]
+    RIGHT_IRIS_IDX = [469, 470, 471, 472]
+
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,   # needed for iris landmarks
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
     # if camera don't open stop program immediately
     if not cap.isOpened():
         raise RuntimeError(
@@ -101,6 +119,20 @@ def main() -> None:
     # Window Display Settings
     window_name = "Real-Time Capture"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    # Iris draw helper
+    def draw_iris(overlay, landmarks, indices, w, h, color=(255, 0, 0)):
+        xs, ys = [], []
+        for i in indices:
+            lm = landmarks.landmark[i]
+            x, y = int(lm.x * w), int(lm.y * h)
+            xs.append(x)
+            ys.append(y)
+            cv2.circle(overlay, (x, y), 1, color, -1)
+
+        cx, cy = int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+        cv2.circle(overlay, (cx, cy), 3, (0, 0, 255), -1)
+        return cx, cy
 
     while True:
         ok, frame = cap.read() # "ok" returns True if CV returns a frame
@@ -127,8 +159,68 @@ def main() -> None:
         # Push into rolling buffer (store resized frames for now)
         buf.push(now, frame_small)
 
+        # Reorder CV frame colours from BGR to RGB for MediaPipe
+        rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb)
+
+        # Check whether exactly one face was detected by Face Mesh
+        face_detected = (
+            results.multi_face_landmarks is not None 
+            and len(results.multi_face_landmarks) == 1 
+        )
+
+        tracking_confidence = 1.0 if face_detected else 0.0
+
         # Overlay: FPS + buffer info
         overlay = frame_small.copy()
+
+        if face_detected:
+            face_landmarks = results.multi_face_landmarks[0]
+
+            h, w = overlay.shape[:2]
+
+            # Face bounding box from landmarks
+            xs = [lm.x for lm in face_landmarks.landmark]
+            ys = [lm.y for lm in face_landmarks.landmark]
+
+            x_min, x_max = int(min(xs) * w), int(max(xs) * w)
+            y_min, y_max = int(min(ys) * h), int(max(ys) * h)
+
+            cv2.rectangle(
+                overlay,
+                (x_min, y_min),
+                (x_max, y_max),
+                (0, 255, 255),  # yellow
+                2,
+            )
+
+            left_iris_center = draw_iris(
+                overlay,
+                face_landmarks,
+                LEFT_IRIS_IDX,
+                w,
+                h,
+            )
+
+            right_iris_center = draw_iris(
+                overlay,
+                face_landmarks,
+                RIGHT_IRIS_IDX,
+                w,
+                h,
+            )
+
+            # Draw full face mesh (debug-first)
+            mp_drawing.draw_landmarks(
+                image=overlay,
+                landmark_list=face_landmarks,
+                connections=mp_face_mesh.FACEMESH_TESSELATION,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=mp_drawing.DrawingSpec(
+                    color=(0, 255, 0), thickness=1, circle_radius=1
+                ),
+            )
+
         info_lines = [
             f"FPS (smoothed): {fps_ema:5.1f}",
             f"Buffer entries: {len(buf)}",
