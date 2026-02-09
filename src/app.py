@@ -74,6 +74,21 @@ def resize_keep_aspect(frame: np.ndarray, target_width: int) -> np.ndarray:
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA) #resize frame
 
 
+def classify_gaze(avg_x, avg_y, calib):
+    cx, cy = calib["center"]
+
+    if avg_x < calib["top_left"][0]:
+        return "off_left"
+    if avg_x > calib["top_right"][0]:
+        return "off_right"
+    if avg_y < calib["top_left"][1]:
+        return "off_up"
+    if avg_y > calib["bottom_left"][1]:
+        return "off_down"
+
+    return "on_screen"
+
+
 SMOOTH_ALPHA = 0.4  # 0.0–1.0 (higher = more responsive, less smooth)
 
 
@@ -90,12 +105,6 @@ def main() -> None:
     # Reference face mesh and drawing utilities
     mp_face_mesh = mp.solutions.face_mesh
     mp_drawing = mp.solutions.drawing_utils
-
-    CONFIDENCE_THRESHOLD = 0.5
-
-    LEFT_IRIS_IDX = [474, 475, 476, 477]
-    RIGHT_IRIS_IDX = [469, 470, 471, 472]
-
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
         max_num_faces=1,
@@ -103,6 +112,40 @@ def main() -> None:
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
+
+    CONFIDENCE_THRESHOLD = 0.5 # for start/stop logic
+
+    # Standard iris coordinates from face mesh
+    LEFT_IRIS_IDX = [474, 475, 476, 477]
+    RIGHT_IRIS_IDX = [469, 470, 471, 472]
+
+    # Calibration Variables
+    calibration_active = False
+    calibration_points = [
+        ("center", 0.5, 0.5),
+        ("top_left", 0.1, 0.1),
+        ("top_right", 0.9, 0.1),
+        ("bottom_left", 0.1, 0.9),
+        ("bottom_right", 0.9, 0.9),
+    ]
+    calibration_data = {}          # target_name -> list of (x, y)
+    calibration_index = 0
+    calibration_start_t = None
+    CALIBRATION_POINT_DURATION = 1.0  # seconds per point
+
+    # Gaze Stability (Calibration)
+    CALIBRATION_STABLE_SECONDS = 2.5
+    CALIBRATION_MAX_SECONDS = 4.0   # safety cap per point
+    CALIBRATION_STD_THRESHOLD = 2.0  # pixels (tune this)
+
+    # Rolling buffer to hold recent averaged eye positions
+    calibration_active = False
+    calibration_data = {}
+    calibration_index = 0
+    calibration_start_t = None
+    calibration_eye_buffer = deque(maxlen=90)  # ~3s at 30fps
+
+    calibration_result = None
 
     # if camera don't open stop program immediately
     if not cap.isOpened():
@@ -205,30 +248,34 @@ def main() -> None:
 
         # Overlay: FPS + buffer info
         overlay = frame_small.copy()
+        h, w = overlay.shape[:2]
 
-        # Reset face landmarks if continuity breaks
-        if not face_detected:
-            prev_face_landmarks = None
+        left_iris_center = None
+        right_iris_center = None
 
         if face_detected:
             current_landmarks = results.multi_face_landmarks[0]
 
             if prev_face_landmarks is None:
-                # First frame: no smoothing yet
                 prev_face_landmarks = current_landmarks
                 face_landmarks = current_landmarks
             else:
-                # EMA smoothing
                 for i, lm in enumerate(current_landmarks.landmark):
                     prev = prev_face_landmarks.landmark[i]
                     prev.x = SMOOTH_ALPHA * lm.x + (1 - SMOOTH_ALPHA) * prev.x
                     prev.y = SMOOTH_ALPHA * lm.y + (1 - SMOOTH_ALPHA) * prev.y
-
                 face_landmarks = prev_face_landmarks
 
             h, w = overlay.shape[:2]
 
-            # Face bounding box from landmarks
+            left_iris_center = draw_iris(
+                overlay, face_landmarks, LEFT_IRIS_IDX, w, h
+            )
+            right_iris_center = draw_iris(
+                overlay, face_landmarks, RIGHT_IRIS_IDX, w, h
+            )
+
+        if face_detected:
             xs = [lm.x for lm in face_landmarks.landmark]
             ys = [lm.y for lm in face_landmarks.landmark]
 
@@ -239,27 +286,10 @@ def main() -> None:
                 overlay,
                 (x_min, y_min),
                 (x_max, y_max),
-                (0, 255, 255),  # yellow
+                (0, 255, 255),
                 2,
             )
 
-            left_iris_center = draw_iris(
-                overlay,
-                face_landmarks,
-                LEFT_IRIS_IDX,
-                w,
-                h,
-            )
-
-            right_iris_center = draw_iris(
-                overlay,
-                face_landmarks,
-                RIGHT_IRIS_IDX,
-                w,
-                h,
-            )
-
-            # Draw full face mesh (debug-first)
             mp_drawing.draw_landmarks(
                 image=overlay,
                 landmark_list=face_landmarks,
@@ -270,6 +300,95 @@ def main() -> None:
                 ),
             )
 
+        # Calibration 
+        if calibration_active:
+            target_name, tx, ty = calibration_points[calibration_index]
+
+            # Draw calibration dot
+            dot_x = int(tx * w)
+            dot_y = int(ty * h)
+            cv2.circle(overlay, (dot_x, dot_y), 10, (0, 255, 255), -1)
+
+            cv2.putText(
+                overlay,
+                f"Calibration: look at the dot ({target_name})",
+                (14, h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            # Initialize storage for this point
+            calibration_data.setdefault(target_name, [])
+
+            # Collect eye data if available
+            if face_detected:
+                lx, ly = left_iris_center
+                rx, ry = right_iris_center
+                avg_x = (lx + rx) / 2
+                avg_y = (ly + ry) / 2
+
+                # Collect avg. eye positions
+                calibration_eye_buffer.append((avg_x, avg_y))
+                calibration_data.setdefault(target_name, []).append((avg_x, avg_y))
+
+            # Logic: Is gaze stable? Y/N
+            stable = False
+
+            if len(calibration_eye_buffer) >= 10:
+                xs, ys = zip(*calibration_eye_buffer)
+                std_x = np.std(xs)
+                std_y = np.std(ys)
+
+                stable = (
+                    std_x < CALIBRATION_STD_THRESHOLD
+                    and std_y < CALIBRATION_STD_THRESHOLD
+                    and (now - calibration_start_t) >= CALIBRATION_STABLE_SECONDS
+                )
+
+            # Move onto next calibration point when gaze is stable
+            elapsed = now - calibration_start_t
+            if stable:
+                calibration_index += 1
+                calibration_start_t = now
+                calibration_eye_buffer.clear()
+
+                if calibration_index >= len(calibration_points):
+                    calibration_active = False
+
+            # HUD: Calibration helper
+            status_text = "Hold steady..."
+            if stable:
+                status_text = "Captured"
+
+            cv2.putText(
+                overlay,
+                status_text,
+                (dot_x - 40, dot_y + 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0) if stable else (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            if not calibration_active and calibration_data and calibration_result is None:
+
+                calibration_result = {}
+
+                for name, samples in calibration_data.items():
+                    if samples:
+                        xs, ys = zip(*samples)
+                        calibration_result[name] = (
+                            float(np.mean(xs)),
+                            float(np.mean(ys)),
+                        )
+
+        # ============== HUD Renderer ==================
+
+        # Main HUD text
         info_lines = [
             f"FPS (smoothed): {fps_ema:5.1f}",
             f"Buffer entries: {len(buf)}",
@@ -279,7 +398,7 @@ def main() -> None:
         ]
 
         y = 28 # starting vertical position
-        # HUD Renderer (draw text on the frame)
+
         for line in info_lines:
             cv2.putText(
                 overlay,
@@ -295,8 +414,18 @@ def main() -> None:
 
         cv2.imshow(window_name, overlay)
 
-        # standard OpenCV boilerplate stuff
+        # Standard OpenCV boilerplate settings
         key = cv2.waitKey(1) & 0xFF
+
+        # Key: Start calibration
+        if key == ord("c") and not calibration_active:
+            calibration_active = True
+            calibration_index = 0
+            calibration_data = {}
+            calibration_start_t = now
+            calibration_eye_buffer.clear()
+
+        # Key: Quit app
         if key in (ord("q"), 27):  # 27 = ESC
             break
 
