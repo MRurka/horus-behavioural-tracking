@@ -74,6 +74,9 @@ def resize_keep_aspect(frame: np.ndarray, target_width: int) -> np.ndarray:
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA) #resize frame
 
 
+SMOOTH_ALPHA = 0.4  # 0.0–1.0 (higher = more responsive, less smooth)
+
+
 def main() -> None:
 
     print("STARTED")
@@ -134,6 +137,8 @@ def main() -> None:
         cv2.circle(overlay, (cx, cy), 3, (0, 0, 255), -1)
         return cx, cy
 
+    prev_face_landmarks = None
+
     while True:
         ok, frame = cap.read() # "ok" returns True if CV returns a frame
         if not ok or frame is None:
@@ -174,8 +179,25 @@ def main() -> None:
         # Overlay: FPS + buffer info
         overlay = frame_small.copy()
 
+        # Reset face landmarks if continuity breaks
+        if not face_detected:
+            prev_face_landmarks = None
+
         if face_detected:
-            face_landmarks = results.multi_face_landmarks[0]
+            current_landmarks = results.multi_face_landmarks[0]
+
+            if prev_face_landmarks is None:
+                # First frame: no smoothing yet
+                prev_face_landmarks = current_landmarks
+                face_landmarks = current_landmarks
+            else:
+                # EMA smoothing
+                for i, lm in enumerate(current_landmarks.landmark):
+                    prev = prev_face_landmarks.landmark[i]
+                    prev.x = SMOOTH_ALPHA * lm.x + (1 - SMOOTH_ALPHA) * prev.x
+                    prev.y = SMOOTH_ALPHA * lm.y + (1 - SMOOTH_ALPHA) * prev.y
+
+                face_landmarks = prev_face_landmarks
 
             h, w = overlay.shape[:2]
 
