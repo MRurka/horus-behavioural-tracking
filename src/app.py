@@ -14,6 +14,8 @@ import mediapipe as mp
 
 import time
 
+from calibration import CalibrationManager, classify_gaze
+
 
 @dataclass # adds stuff to AppConfig
 class AppConfig:
@@ -74,21 +76,6 @@ def resize_keep_aspect(frame: np.ndarray, target_width: int) -> np.ndarray:
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA) #resize frame
 
 
-def classify_gaze(avg_x, avg_y, calib):
-    cx, cy = calib["center"]
-
-    if avg_x < calib["top_left"][0]:
-        return "off_left"
-    if avg_x > calib["top_right"][0]:
-        return "off_right"
-    if avg_y < calib["top_left"][1]:
-        return "off_up"
-    if avg_y > calib["bottom_left"][1]:
-        return "off_down"
-
-    return "on_screen"
-
-
 SMOOTH_ALPHA = 0.4  # 0.0–1.0 (higher = more responsive, less smooth)
 
 
@@ -99,6 +86,7 @@ def main() -> None:
 
     cfg = AppConfig() # creates an instance of AppConfig dataclass
     cap = cv2.VideoCapture(cfg.camera_index) # open connection to camera device
+    calib = CalibrationManager()
 
     print("cap.isOpened =", cap.isOpened())
 
@@ -118,34 +106,6 @@ def main() -> None:
     # Standard iris coordinates from face mesh
     LEFT_IRIS_IDX = [474, 475, 476, 477]
     RIGHT_IRIS_IDX = [469, 470, 471, 472]
-
-    # Calibration Variables
-    calibration_active = False
-    calibration_points = [
-        ("center", 0.5, 0.5),
-        ("top_left", 0.1, 0.1),
-        ("top_right", 0.9, 0.1),
-        ("bottom_left", 0.1, 0.9),
-        ("bottom_right", 0.9, 0.9),
-    ]
-    calibration_data = {}          # target_name -> list of (x, y)
-    calibration_index = 0
-    calibration_start_t = None
-    CALIBRATION_POINT_DURATION = 1.0  # seconds per point
-
-    # Gaze Stability (Calibration)
-    CALIBRATION_STABLE_SECONDS = 2.5
-    CALIBRATION_MAX_SECONDS = 4.0   # safety cap per point
-    CALIBRATION_STD_THRESHOLD = 2.0  # pixels (tune this)
-
-    # Rolling buffer to hold recent averaged eye positions
-    calibration_active = False
-    calibration_data = {}
-    calibration_index = 0
-    calibration_start_t = None
-    calibration_eye_buffer = deque(maxlen=90)  # ~3s at 30fps
-
-    calibration_result = None
 
     # if camera don't open stop program immediately
     if not cap.isOpened():
@@ -252,6 +212,8 @@ def main() -> None:
 
         left_iris_center = None
         right_iris_center = None
+        avg_eye_xy = None
+
 
         if face_detected:
             current_landmarks = results.multi_face_landmarks[0]
@@ -274,6 +236,12 @@ def main() -> None:
             right_iris_center = draw_iris(
                 overlay, face_landmarks, RIGHT_IRIS_IDX, w, h
             )
+
+            if left_iris_center is not None and right_iris_center is not None:
+                lx, ly = left_iris_center
+                rx, ry = right_iris_center
+                avg_eye_xy = ((lx + rx) / 2, (ly + ry) / 2)
+
 
         if face_detected:
             xs = [lm.x for lm in face_landmarks.landmark]
@@ -300,91 +268,11 @@ def main() -> None:
                 ),
             )
 
-        # Calibration 
-        if calibration_active:
-            target_name, tx, ty = calibration_points[calibration_index]
+        # Calibration update & draw
+        if calib.is_active():
+            calib.update(now, avg_eye_xy)
+            calib.draw(overlay)
 
-            # Draw calibration dot
-            dot_x = int(tx * w)
-            dot_y = int(ty * h)
-            cv2.circle(overlay, (dot_x, dot_y), 10, (0, 255, 255), -1)
-
-            cv2.putText(
-                overlay,
-                f"Calibration: look at the dot ({target_name})",
-                (14, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            # Initialize storage for this point
-            calibration_data.setdefault(target_name, [])
-
-            # Collect eye data if available
-            if face_detected:
-                lx, ly = left_iris_center
-                rx, ry = right_iris_center
-                avg_x = (lx + rx) / 2
-                avg_y = (ly + ry) / 2
-
-                # Collect avg. eye positions
-                calibration_eye_buffer.append((avg_x, avg_y))
-                calibration_data.setdefault(target_name, []).append((avg_x, avg_y))
-
-            # Logic: Is gaze stable? Y/N
-            stable = False
-
-            if len(calibration_eye_buffer) >= 10:
-                xs, ys = zip(*calibration_eye_buffer)
-                std_x = np.std(xs)
-                std_y = np.std(ys)
-
-                stable = (
-                    std_x < CALIBRATION_STD_THRESHOLD
-                    and std_y < CALIBRATION_STD_THRESHOLD
-                    and (now - calibration_start_t) >= CALIBRATION_STABLE_SECONDS
-                )
-
-            # Move onto next calibration point when gaze is stable
-            elapsed = now - calibration_start_t
-            if stable:
-                calibration_index += 1
-                calibration_start_t = now
-                calibration_eye_buffer.clear()
-
-                if calibration_index >= len(calibration_points):
-                    calibration_active = False
-
-            # HUD: Calibration helper
-            status_text = "Hold steady..."
-            if stable:
-                status_text = "Captured"
-
-            cv2.putText(
-                overlay,
-                status_text,
-                (dot_x - 40, dot_y + 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0) if stable else (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            if not calibration_active and calibration_data and calibration_result is None:
-
-                calibration_result = {}
-
-                for name, samples in calibration_data.items():
-                    if samples:
-                        xs, ys = zip(*samples)
-                        calibration_result[name] = (
-                            float(np.mean(xs)),
-                            float(np.mean(ys)),
-                        )
 
         # ============== HUD Renderer ==================
 
@@ -418,12 +306,8 @@ def main() -> None:
         key = cv2.waitKey(1) & 0xFF
 
         # Key: Start calibration
-        if key == ord("c") and not calibration_active:
-            calibration_active = True
-            calibration_index = 0
-            calibration_data = {}
-            calibration_start_t = now
-            calibration_eye_buffer.clear()
+        if key == ord("c"):
+            calib.start(now)
 
         # Key: Quit app
         if key in (ord("q"), 27):  # 27 = ESC
