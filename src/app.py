@@ -91,6 +91,8 @@ def main() -> None:
     mp_face_mesh = mp.solutions.face_mesh
     mp_drawing = mp.solutions.drawing_utils
 
+    CONFIDENCE_THRESHOLD = 0.5
+
     LEFT_IRIS_IDX = [474, 475, 476, 477]
     RIGHT_IRIS_IDX = [469, 470, 471, 472]
 
@@ -139,6 +141,10 @@ def main() -> None:
 
     prev_face_landmarks = None
 
+    quality_events = []
+    quality_segment_active = False
+    quality_segment_start = None
+
     while True:
         ok, frame = cap.read() # "ok" returns True if CV returns a frame
         if not ok or frame is None:
@@ -175,6 +181,27 @@ def main() -> None:
         )
 
         tracking_confidence = 1.0 if face_detected else 0.0
+
+        can_score = (
+            face_detected
+            and tracking_confidence >= CONFIDENCE_THRESHOLD
+        )
+
+        # Log "bad quality" segment
+        if not can_score:
+            if not quality_segment_active:
+                quality_segment_active = True
+                quality_segment_start = now
+        else:
+            if quality_segment_active:
+                quality_events.append({
+                    "type": "quality_gate",
+                    "start": quality_segment_start,
+                    "end": now,
+                    "reason": "face_missing_or_low_confidence",
+                })
+                quality_segment_active = False
+                quality_segment_start = None
 
         # Overlay: FPS + buffer info
         overlay = frame_small.copy()
@@ -247,6 +274,7 @@ def main() -> None:
             f"FPS (smoothed): {fps_ema:5.1f}",
             f"Buffer entries: {len(buf)}",
             f"Buffer span:    {buf.age_span_seconds():4.1f}s (target {cfg.buffer_seconds:.0f}s)",
+            f"Tracking OK: {can_score}",
             "Quit: q or ESC",
         ]
 
@@ -258,9 +286,9 @@ def main() -> None:
                 line,
                 (14, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.6,
                 (255, 255, 255),
-                2,
+                1,
                 cv2.LINE_AA,
             )
             y += 28
