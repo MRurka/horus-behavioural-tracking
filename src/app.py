@@ -101,6 +101,8 @@ def main() -> None:
         min_tracking_confidence=0.5,
     )
 
+    window_centered = False # for centering the window 
+
     CONFIDENCE_THRESHOLD = 0.5 # for start/stop logic
 
     # Standard iris coordinates from face mesh
@@ -127,6 +129,7 @@ def main() -> None:
     # Window Display Settings
     window_name = "Real-Time Capture"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
 
     # Iris draw helper
     def draw_iris(overlay, landmarks, indices, w, h, color=(255, 0, 0)):
@@ -169,6 +172,33 @@ def main() -> None:
 
         # Resize for performance and consistent UI
         frame_small = resize_keep_aspect(frame, cfg.display_width)
+
+        # Center window once after we know actual frame size
+        if not window_centered:
+            h, w = frame_small.shape[:2]
+
+            cv2.resizeWindow(window_name, w, h)
+
+            # Approximate Mac screen size (adjust if needed)
+            screen_w = 1728
+            screen_h = 1117
+
+            pos_x = int((screen_w - w) / 2)
+            pos_y = int((screen_h - h) / 2)
+
+            cv2.moveWindow(window_name, pos_x, pos_y)
+
+            # After your first moveWindow(window_name, pos_x, pos_y)
+            TOP_GAP_PX = 383
+            BOTTOM_GAP_PX = 280
+
+            # If top gap is bigger than bottom gap, window is too low -> move up.
+            correction_y = int((TOP_GAP_PX - BOTTOM_GAP_PX) / 2)
+            pos_y = pos_y - correction_y
+
+            cv2.moveWindow(window_name, pos_x, pos_y)
+
+            window_centered = True
 
         # Push into rolling buffer (store resized frames for now)
         buf.push(now, frame_small)
@@ -242,6 +272,13 @@ def main() -> None:
                 rx, ry = right_iris_center
                 avg_eye_xy = ((lx + rx) / 2, (ly + ry) / 2)
 
+        gaze_label = None
+        calib_result = calib.result()  # dict or None
+
+        if calib_result is not None and avg_eye_xy is not None:
+            avg_x, avg_y = avg_eye_xy
+            gaze_label = classify_gaze(avg_x, avg_y, calib_result)
+
 
         if face_detected:
             xs = [lm.x for lm in face_landmarks.landmark]
@@ -284,6 +321,11 @@ def main() -> None:
             f"Tracking OK: {can_score}",
             "Quit: q or ESC",
         ]
+
+        # Display Gaze status (off-left, off-down, etc.)
+        if gaze_label is not None:
+            info_lines.append(f"Gaze: {gaze_label}")
+
 
         y = 28 # starting vertical position
 
